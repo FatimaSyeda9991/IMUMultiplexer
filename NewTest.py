@@ -1,47 +1,59 @@
+#!/usr/bin/python3
 """
-TCA9548A IMU TEST USING ADAPTER LIBRARY
-Tests 3 MPU9250 sensors on channels 2, 3, 4
+MPU9250 IMU TEST WITH TCA9548A MULTIPLEXER
+Using the simple I2C switch class
 """
 
 import time
-import board
-import adafruit_tca9548a
+import smbus
 from smbus2 import SMBus
 
+# Your TCA9548A I2C multiplexer class
+class I2C_SW(object):
+    def __init__(self, name, address, bus_nr):
+        self.name = name
+        self.address = address
+        self.bus_nr = bus_nr
+        self.bus = smbus.SMBus(bus_nr)
+
+    def chn(self, channel):
+        """Change to i2c channel 0..7"""
+        self.bus.write_byte(self.address, 2**channel)
+        time.sleep(0.01)  # Added small delay
+
+    def _rst(self):
+        """Block all channels"""
+        self.bus.write_byte(self.address, 0)
+        print(self.name, ' ', 'Switch reset')
+
+    def _all(self):
+        """Read all 8 channels"""
+        self.bus.write_byte(self.address, 0xff)
+        print(self.name, ' ', 'Switch read all lines')
+
+# Simple MPU9250 class
 class MPU9250_Simple:
-    """Simple MPU9250 driver compatible with the multiplexer"""
-    
-    def __init__(self, i2c, address=0x69):
-        self.i2c = i2c
+    def __init__(self, bus, address=0x69):
+        self.bus = bus
         self.addr = address
         
         # Wake up the device
-        self._write_byte(0x6B, 0x00)
+        self.bus.write_byte_data(self.addr, 0x6B, 0x00)
         time.sleep(0.1)
     
-    def _write_byte(self, register, value):
-        """Write a byte to the specified register"""
-        self.i2c.writeto(self.addr, bytes([register, value]))
-    
-    def _read_bytes(self, register, length):
-        """Read bytes from the specified register"""
-        result = bytearray(length)
-        self.i2c.writeto_then_readfrom(self.addr, bytes([register]), result)
-        return result
-    
     def detect(self):
-        """Check if MPU9250 is present and identify it"""
+        """Check if MPU9250 is present"""
         try:
-            who_am_i = self._read_bytes(0x75, 1)[0]
+            who_am_i = self.bus.read_byte_data(self.addr, 0x75)
             return who_am_i
         except:
             return None
     
-    def read_accel_gyro(self):
+    def read_data(self):
         """Read accelerometer and gyroscope data"""
         try:
             # Read 14 bytes starting from ACCEL_XOUT_H (0x3B)
-            data = self._read_bytes(0x3B, 14)
+            data = self.bus.read_i2c_block_data(self.addr, 0x3B, 14)
             
             # Convert to acceleration (m/s²)
             ax = self._convert(data[0], data[1]) / 4096.0 * 9.80665
@@ -70,118 +82,90 @@ class MPU9250_Simple:
         value = (high << 8) | low
         return value - 65536 if value >= 32768 else value
 
-def scan_all_channels(tca):
+def scan_all_channels(switch):
     """Scan all channels for I2C devices"""
-    print("SCANNING ALL CHANNELS FOR I2C DEVICES:")
+    print("SCANNING ALL MULTIPLEXER CHANNELS:")
     print("=" * 50)
     
-    devices_found = {}
-    
     for channel in range(8):
+        switch.chn(channel)
         print(f"Channel {channel}: ", end="")
         
-        if tca[channel].try_lock():
+        devices = []
+        for addr in [0x68, 0x69]:  # Common IMU addresses
             try:
-                # Scan for devices on this channel
-                addresses = tca[channel].scan()
-                # Filter out the multiplexer itself (0x70)
-                filtered_addresses = [addr for addr in addresses if addr != 0x70]
-                
-                if filtered_addresses:
-                    print([hex(addr) for addr in filtered_addresses])
-                    devices_found[channel] = filtered_addresses
-                else:
-                    print("No devices found")
-                    
-            except Exception as e:
-                print(f"Scan error: {e}")
-            finally:
-                tca[channel].unlock()
+                # Try to read WHO_AM_I register
+                who_am_i = switch.bus.read_byte_data(addr, 0x75)
+                devices.append(f"0x{addr:02x}(0x{who_am_i:02x})")
+            except:
+                pass
+        
+        if devices:
+            print(devices)
         else:
-            print("Failed to lock channel")
-    
-    return devices_found
+            print("No IMUs found")
 
-def test_imu_on_channels(tca, channels_to_test, imu_address=0x69):
-    """Test IMU detection and functionality on specific channels"""
-    print(f"\nTESTING IMUs ON CHANNELS {channels_to_test} AT ADDRESS 0x{imu_address:02x}:")
-    print("=" * 60)
+def test_imus(switch, channels_to_test):
+    """Test IMUs on specific channels"""
+    print(f"\nTESTING IMUs ON CHANNELS {channels_to_test}:")
+    print("=" * 50)
     
     imus = {}
     
     for channel in channels_to_test:
         print(f"\nChannel {channel}:")
+        switch.chn(channel)
         
-        if tca[channel].try_lock():
+        # Try both addresses
+        for imu_addr in [0x68, 0x69]:
             try:
-                # Try to initialize IMU
-                imu = MPU9250_Simple(tca[channel], imu_address)
-                
-                # Test detection
+                imu = MPU9250_Simple(switch.bus, imu_addr)
                 who_am_i = imu.detect()
                 
-                if who_am_i is not None:
-                    print(f"  ✓ IMU detected - WHO_AM_I: 0x{who_am_i:02x}")
+                if who_am_i == 0x71:  # MPU9250
+                    print(f"  ✓ MPU9250 found at 0x{imu_addr:02x}")
                     
-                    if who_am_i == 0x71:
-                        print("  ✓ Confirmed: MPU9250")
-                    elif who_am_i == 0x73:
-                        print("  ⚠ Detected: MPU9255")
-                    else:
-                        print(f"  ❓ Unknown device: 0x{who_am_i:02x}")
-                    
-                    # Test data reading
-                    data = imu.read_accel_gyro()
+                    # Test reading data
+                    data = imu.read_data()
                     if data['success']:
-                        print("  ✓ Data reading: SUCCESS")
+                        print(f"  ✓ Data reading successful")
                         print(f"    Temp: {data['temp']:.1f}°C")
-                        print(f"    Accel: ({data['accel'][0]:6.3f}, {data['accel'][1]:6.3f}, {data['accel'][2]:6.3f}) m/s²")
-                        print(f"    Gyro:  ({data['gyro'][0]:6.3f}, {data['gyro'][1]:6.3f}, {data['gyro'][2]:6.3f}) rad/s")
-                        
                         imus[channel] = imu
                     else:
-                        print(f"  ✗ Data reading failed: {data['error']}")
-                else:
-                    print("  ✗ No IMU detected")
+                        print(f"  ✗ Data reading failed: {data['error']")
+                        
+                    break  # Found IMU, no need to check other address
                     
             except Exception as e:
-                print(f"  ✗ IMU test failed: {e}")
-            finally:
-                tca[channel].unlock()
-        else:
-            print("  ✗ Failed to lock channel")
+                continue  # Try next address
+        
+        if channel not in imus:
+            print("  ✗ No IMU found")
     
     return imus
 
-def continuous_read(tca, imus, read_interval=1.0):
+def continuous_read(switch, imus, read_interval=1.0):
     """Continuous reading from all detected IMUs"""
-    print(f"\nSTARTING CONTINUOUS READINGS (every {read_interval}s):")
-    print("=" * 70)
+    print(f"\nSTARTING CONTINUOUS READINGS:")
     print("Press Ctrl+C to stop")
-    print("=" * 70)
+    print("=" * 60)
     
     try:
         count = 0
         while True:
             count += 1
-            print(f"\n--- Reading {count} | {time.strftime('%H:%M:%S')} ---")
+            print(f"\n--- Reading {count} ---")
             
             for channel, imu in imus.items():
-                if tca[channel].try_lock():
-                    try:
-                        data = imu.read_accel_gyro()
-                        if data['success']:
-                            print(f"CH{channel}: Temp:{data['temp']:5.1f}°C | "
-                                  f"Accel:({data['accel'][0]:6.3f},{data['accel'][1]:6.3f},{data['accel'][2]:6.3f}) | "
-                                  f"Gyro:({data['gyro'][0]:6.3f},{data['gyro'][1]:6.3f},{data['gyro'][2]:6.3f})")
-                        else:
-                            print(f"CH{channel}: READ ERROR - {data['error']}")
-                    except Exception as e:
-                        print(f"CH{channel}: EXCEPTION - {e}")
-                    finally:
-                        tca[channel].unlock()
+                switch.chn(channel)
+                data = imu.read_data()
+                
+                if data['success']:
+                    print(f"CH{channel}: Temp:{data['temp']:5.1f}°C | "
+                          f"Accel:({data['accel'][0]:6.3f},{data['accel'][1]:6.3f},{data['accel'][2]:6.3f}) | "
+                          f"Gyro:({data['gyro'][0]:6.3f},{data['gyro'][1]:6.3f},{data['gyro'][2]:6.3f})")
                 else:
-                    print(f"CH{channel}: Failed to lock channel")
+                    print(f"CH{channel}: READ ERROR")
             
             time.sleep(read_interval)
             
@@ -189,54 +173,44 @@ def continuous_read(tca, imus, read_interval=1.0):
         print("\nStopped by user")
 
 def main():
-    print("\n" + "="*70)
-    print("TCA9548A IMU TEST USING ADAPTER LIBRARY")
-    print("="*70)
-    print("Configuration:")
-    print("  - IMU Address: 0x69")
-    print("  - Expected channels: 2, 3, 4")
-    print("="*70)
+    print("MPU9250 IMU TEST WITH TCA9548A MULTIPLEXER")
+    print("=" * 60)
     
     try:
-        # Initialize I2C and multiplexer
-        print("Initializing I2C and TCA9548A...")
-        i2c = board.I2C()  # Uses board.SCL and board.SDA
-        tca = adafruit_tca9548a.TCA9548A(i2c)
-        print("✓ TCA9548A initialized successfully")
+        # Initialize the multiplexer - CHANGE BUS NUMBER IF NEEDED!
+        print("Initializing TCA9548A multiplexer...")
+        SW = I2C_SW('I2C_Multiplexer', 0x70, 7)  # Try bus 1, 7, or 8
         
-        # Step 1: Scan all channels
-        devices_found = scan_all_channels(tca)
+        # Test multiplexer
+        SW._rst()
         
-        # Step 2: Test IMUs on expected channels
+        # Scan all channels
+        scan_all_channels(SW)
+        
+        # Test IMUs on expected channels
         expected_channels = [2, 3, 4]
-        imus = test_imu_on_channels(tca, expected_channels, imu_address=0x69)
+        imus = test_imus(SW, expected_channels)
         
-        # Step 3: Summary
-        print("\n" + "="*70)
-        print("TEST SUMMARY")
-        print("="*70)
-        print(f"Channels scanned: 0-7")
-        print(f"IMUs found: {len(imus)}/{len(expected_channels)}")
-        
+        # Summary
+        print(f"\nSUMMARY: Found {len(imus)}/{len(expected_channels)} IMUs")
         if imus:
             print(f"Working channels: {list(imus.keys())}")
             
-            # Step 4: Continuous reading if IMUs found
+            # Start continuous reading
             if input("\nStart continuous readings? (y/n): ").lower().startswith('y'):
-                continuous_read(tca, imus)
+                continuous_read(SW, imus)
         else:
             print("\nNo IMUs found. Check:")
-            print("1. IMU power (3.3V)")
-            print("2. I2C connections")
-            print("3. IMU address (AD0 pin should be high for 0x69)")
-            print("4. Multiplexer channel connections")
+            print("1. Bus number (try 1, 7, or 8)")
+            print("2. IMU power (3.3V)")
+            print("3. I2C connections")
+            print("4. Run: sudo i2cdetect -y [bus_number]")
             
     except Exception as e:
-        print(f"\n❌ INITIALIZATION FAILED: {e}")
-        print("\nTroubleshooting:")
-        print("1. Check I2C is enabled: raspi-config → Interface Options → I2C")
-        print("2. Verify wiring: SDA, SCL, power, ground")
-        print("3. Try running with: sudo python3 script.py")
+        print(f"❌ ERROR: {e}")
+        print("\nTry different bus numbers:")
+        print("1. Change bus_nr in I2C_SW() to 1, 7, or 8")
+        print("2. Run: sudo i2cdetect -l  to list available buses")
 
 if __name__ == "__main__":
     main()
